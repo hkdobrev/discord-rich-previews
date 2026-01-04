@@ -13,9 +13,11 @@ export interface Env {
 export class DiscordBot extends DurableObject<Env> {
   private client: DiscordClient;
   private messageHelper: MessageHelper | null = null;
+  private botToken: string;
   private rateLimitTimestamps: Map<string, number[]> = new Map();
   private readonly RATE_LIMIT_MAX_REQUESTS = 10;
   private readonly RATE_LIMIT_WINDOW_MS = 60000; // 1 minute
+  private readonly SUPPRESS_EMBEDS_FLAG = 1 << 2; // 4
 
   constructor(ctx: DurableObjectState, env: Env) {
     try {
@@ -25,6 +27,8 @@ export class DiscordBot extends DurableObject<Env> {
         console.error('[ERROR] DISCORD_BOT_TOKEN is missing from environment');
         throw new Error('DISCORD_BOT_TOKEN is required');
       }
+
+      this.botToken = env.DISCORD_BOT_TOKEN;
 
       this.client = new DiscordClient(ctx, {
       token: env.DISCORD_BOT_TOKEN,
@@ -47,6 +51,7 @@ export class DiscordBot extends DurableObject<Env> {
           content?: string;
           channel_id?: string;
           guild_id?: string;
+          flags?: number;
         };
 
         // Ignore bot messages
@@ -78,6 +83,17 @@ export class DiscordBot extends DurableObject<Env> {
         if (!channelId || this.isRateLimited(channelId)) {
           console.log(`[INFO] [RATE_LIMIT] Rate limit exceeded for channel ${channelId}`);
           return;
+        }
+
+        // Suppress native Discord embeds on the original message
+        // Small delay reduces "embed flicker" (Discord may render before we suppress)
+        try {
+          await new Promise(resolve => setTimeout(resolve, 600));
+          await this.suppressEmbeds(channelId, messageId, message.flags);
+          console.log(`[INFO] [SUPPRESS] Suppressed embeds for message ${messageId}`);
+        } catch (suppressError) {
+          console.error(`[ERROR] [SUPPRESS] Failed to suppress embeds for message ${messageId}:`, suppressError instanceof Error ? suppressError.message : suppressError);
+          // Continue even if suppress fails - we still want to post our embed
         }
 
         const messageHelper = this.messageHelper; // Store reference to avoid null check issues
@@ -152,6 +168,58 @@ export class DiscordBot extends DurableObject<Env> {
       if (error instanceof Error && error.stack) {
         console.error('[ERROR] Stack:', error.stack);
       }
+      throw error;
+    }
+  }
+
+  /**
+   * Suppress native Discord embeds on a message by setting the SUPPRESS_EMBEDS flag
+   * Requires bot to have "Manage Messages" permission
+   */
+  private async suppressEmbeds(channelId: string, messageId: string, currentFlags?: number): Promise<void> {
+    try {
+      // Get current message flags if not provided
+      let flags = currentFlags;
+      if (typeof flags !== 'number') {
+        try {
+          const url = `https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`;
+          const response = await fetch(url, {
+            headers: {
+              Authorization: `Bot ${this.botToken}`,
+            },
+          });
+
+          if (!response.ok) {
+            throw new Error(`Discord API error: ${response.status} ${response.statusText}`);
+          }
+
+          const messageData = await response.json() as { flags?: number };
+          flags = messageData.flags ?? 0;
+        } catch (error) {
+          console.error(`[ERROR] [SUPPRESS] Failed to fetch message flags:`, error instanceof Error ? error.message : error);
+          flags = 0; // Default to 0 if fetch fails
+        }
+      }
+
+      // Set the SUPPRESS_EMBEDS flag
+      const url = `https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`;
+      const response = await fetch(url, {
+        method: 'PATCH',
+        headers: {
+          Authorization: `Bot ${this.botToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          flags: flags | this.SUPPRESS_EMBEDS_FLAG,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        throw new Error(`Discord API error: ${response.status} ${response.statusText} - ${errorText}`);
+      }
+    } catch (error) {
+      console.error(`[ERROR] [SUPPRESS] Error suppressing embeds:`, error instanceof Error ? error.message : error);
       throw error;
     }
   }
