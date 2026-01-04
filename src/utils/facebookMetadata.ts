@@ -1,7 +1,7 @@
 /**
- * Fetches Open Graph metadata from Facebook URLs
+ * Generic link metadata interface (works for any provider)
  */
-export interface FacebookMetadata {
+export interface LinkMetadata {
   title?: string;
   description?: string;
   image?: string;
@@ -9,13 +9,15 @@ export interface FacebookMetadata {
   url?: string;
   siteName?: string;
   type?: string;
+  articleTitle?: string; // Article title from title_with_entities (for posts linking to articles)
+  articleUrl?: string; // External web link URL from attachment.web_link (for posts linking to articles)
 }
 
 /**
  * Extracts metadata from HTML content
  */
-function extractMetadataFromHtml(html: string, url: string): FacebookMetadata | null {
-  const metadata: FacebookMetadata = {};
+function extractMetadataFromHtml(html: string, url: string): LinkMetadata | null {
+  const metadata: LinkMetadata = {};
 
   // Extract og:title
   const titleMatch = html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i);
@@ -32,7 +34,27 @@ function extractMetadataFromHtml(html: string, url: string): FacebookMetadata | 
   // Extract og:image (decode HTML entities so image hash works correctly)
   const imageMatch = html.match(/<meta\s+property=["']og:image["']\s+content=["']([^"']+)["']/i);
   if (imageMatch) {
-    metadata.image = decodeHtmlEntities(imageMatch[1]);
+    let imageUrl = decodeHtmlEntities(imageMatch[1]);
+
+    // Extract original image URL from Facebook CDN URLs to preserve aspect ratio
+    // Facebook CDN URLs contain the original URL in a 'url' parameter
+    // Example: https://external.fsof11-1.fna.fbcdn.net/emg1/...?url=https%3A%2F%2Fwww.mediapool.bg%2fimages%2f...
+    if (imageUrl.includes('fbcdn.net') && imageUrl.includes('url=')) {
+      try {
+        const urlObj = new URL(imageUrl);
+        const originalUrlParam = urlObj.searchParams.get('url');
+        if (originalUrlParam) {
+          // Use the original URL instead of Facebook CDN URL
+          // This preserves the original aspect ratio instead of getting square images
+          imageUrl = decodeURIComponent(originalUrlParam);
+        }
+      } catch (urlError) {
+        // If URL parsing fails, use the original imageUrl
+        console.error(`[ERROR] [METADATA] Failed to extract original URL from Facebook CDN URL:`, urlError instanceof Error ? urlError.message : urlError);
+      }
+    }
+
+    metadata.image = imageUrl;
   }
 
   // Try to extract profile picture from JSON data in the page (for thumbnail)
@@ -79,6 +101,113 @@ function extractMetadataFromHtml(html: string, url: string): FacebookMetadata | 
   const typeMatch = html.match(/<meta\s+property=["']og:type["']\s+content=["']([^"']+)["']/i);
   if (typeMatch) {
     metadata.type = typeMatch[1];
+  }
+
+  // Extract article title from title_with_entities JSON pattern
+  // Pattern: ,"title_with_entities":{"text":"Article Title Here"
+  // Use a simpler pattern and handle decoding manually
+  try {
+    const articleTitlePatterns = [
+      /,"title_with_entities":\{"text":"([^"]*(?:\\.[^"]*)*)"/,
+      /"title_with_entities":\{"text":"([^"]*(?:\\.[^"]*)*)"/,
+    ];
+
+    for (const pattern of articleTitlePatterns) {
+      try {
+        const articleTitleMatch = html.match(pattern);
+        if (articleTitleMatch && articleTitleMatch[1]) {
+          let articleTitle = articleTitleMatch[1];
+
+          // Decode Unicode escape sequences first - this is critical for non-ASCII characters
+          // Handle multiple passes in case of double-escaping (e.g., \\u041a)
+          let previousTitle = '';
+          let iterations = 0;
+          while (articleTitle !== previousTitle && iterations < 10) {
+            previousTitle = articleTitle;
+            articleTitle = articleTitle.replace(/\\u([0-9a-fA-F]{4})/gi, (match, hex) => {
+              const codePoint = parseInt(hex, 16);
+              try {
+                return String.fromCodePoint(codePoint);
+              } catch {
+                return String.fromCharCode(codePoint > 0xFFFF ? 0xFFFD : codePoint);
+              }
+            });
+            iterations++;
+          }
+
+          // Now handle other escape sequences
+          articleTitle = articleTitle
+            .replace(/\\"/g, '"') // Unescape quotes
+            .replace(/\\n/g, ' ') // Replace newlines with spaces
+            .replace(/\\t/g, ' ') // Replace tabs with spaces
+            .replace(/\\r/g, '') // Remove carriage returns
+            .replace(/\\\\/g, '\\'); // Unescape remaining backslashes
+
+          articleTitle = cleanEscapeSequences(decodeHtmlEntities(articleTitle));
+
+          if (articleTitle && articleTitle.trim()) {
+            metadata.articleTitle = articleTitle.trim();
+            break;
+          }
+        }
+      } catch (patternError) {
+        // Continue to next pattern if this one fails
+        console.error(`[ERROR] [METADATA] Error extracting article title with pattern:`, patternError instanceof Error ? patternError.message : patternError);
+      }
+    }
+  } catch (error) {
+    // Don't fail metadata extraction if article title extraction fails
+    console.error(`[ERROR] [METADATA] Error in article title extraction:`, error instanceof Error ? error.message : error);
+  }
+
+  // Extract ExternalWebLink URL from attachment pattern
+  // Pattern: "attachment":{"web_link":{"__typename":"ExternalWebLink","url":"https://..."
+  try {
+    const externalWebLinkPatterns = [
+      /"attachment":\{"web_link":\{"__typename":"ExternalWebLink","url":"([^"]*(?:\\.[^"]*)*)"/,
+      /"web_link":\{"__typename":"ExternalWebLink","url":"([^"]*(?:\\.[^"]*)*)"/,
+    ];
+
+    for (const pattern of externalWebLinkPatterns) {
+      try {
+        const urlMatch = html.match(pattern);
+        if (urlMatch && urlMatch[1]) {
+          // Decode JSON escape sequences in URL
+          let articleUrl = urlMatch[1]
+            .replace(/\\"/g, '"') // Unescape quotes
+            .replace(/\\\//g, '/') // Unescape forward slashes
+            .replace(/\\u([0-9a-fA-F]{4})/gi, (_, hex) => {
+              const codePoint = parseInt(hex, 16);
+              try {
+                return String.fromCodePoint(codePoint);
+              } catch {
+                return String.fromCharCode(codePoint > 0xFFFF ? 0xFFFD : codePoint);
+              }
+            })
+            .replace(/\\\\/g, '\\'); // Unescape backslashes
+
+          // Decode HTML entities in URL
+          articleUrl = decodeHtmlEntities(articleUrl);
+
+          if (articleUrl && articleUrl.trim()) {
+            // Validate it's a proper URL
+            try {
+              new URL(articleUrl);
+              metadata.articleUrl = articleUrl.trim();
+              break;
+            } catch {
+              // Invalid URL, skip it
+            }
+          }
+        }
+      } catch (patternError) {
+        // Continue to next pattern if this one fails
+        console.error(`[ERROR] [METADATA] Error extracting article URL with pattern:`, patternError instanceof Error ? patternError.message : patternError);
+      }
+    }
+  } catch (error) {
+    // Don't fail metadata extraction if article URL extraction fails
+    console.error(`[ERROR] [METADATA] Error in article URL extraction:`, error instanceof Error ? error.message : error);
   }
 
   // Fallback to regular title tag if og:title not found
@@ -136,7 +265,7 @@ async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: nu
 export async function fetchFacebookMetadata(
   url: string,
   cache?: KVNamespace
-): Promise<FacebookMetadata | null> {
+): Promise<LinkMetadata | null> {
   try {
     // Check cache first
     if (cache) {
@@ -144,7 +273,7 @@ export async function fetchFacebookMetadata(
       try {
         const cached = await cache.get(cacheKey);
         if (cached) {
-          return JSON.parse(cached) as FacebookMetadata;
+          return JSON.parse(cached) as LinkMetadata;
         }
       } catch (cacheError) {
         console.error(`[ERROR] Cache read error:`, cacheError instanceof Error ? cacheError.message : cacheError);
@@ -160,6 +289,21 @@ export async function fetchFacebookMetadata(
     if (url.includes('/share/')) {
       // Ensure we're using the www version for better metadata extraction
       normalizedUrl = url.replace(/^(https?:\/\/)(m\.|www\.)?(facebook\.com)/, '$1www.$3');
+    }
+
+    // Handle Facebook story.php URLs - normalize to www version and ensure proper format
+    if (url.includes('story.php')) {
+      try {
+        const urlObj = new URL(url);
+        // Ensure we're using www.facebook.com for better metadata extraction
+        if (!urlObj.hostname.startsWith('www.')) {
+          urlObj.hostname = urlObj.hostname.replace(/^(m\.)?(facebook\.com)$/, 'www.$2');
+        }
+        normalizedUrl = urlObj.toString();
+      } catch (urlError) {
+        console.error(`[ERROR] [URL_NORMALIZE] Failed to normalize story.php URL ${url}:`, urlError instanceof Error ? urlError.message : urlError);
+        // Continue with original URL if normalization fails
+      }
     }
 
     // Fetch the HTML content with browser-like headers to avoid detection (with timeout)
@@ -186,8 +330,11 @@ export async function fetchFacebookMetadata(
     );
 
     if (!response.ok) {
-      // If we get blocked, try the mobile version
+      console.error(`[ERROR] [FETCH] HTTP ${response.status} for ${normalizedUrl}`);
+
+      // If we get blocked or authentication required, try the mobile version
       if (response.status === 400 || response.status === 403 || response.status === 401) {
+        console.log(`[INFO] [FETCH] Attempting mobile fallback for ${normalizedUrl}`);
         const mobileUrl = normalizedUrl.replace(/www\.facebook\.com/, 'm.facebook.com');
         try {
           const mobileResponse = await fetchWithTimeout(
@@ -208,12 +355,26 @@ export async function fetchFacebookMetadata(
             const html = await mobileResponse.text();
             const metadata = extractMetadataFromHtml(html, mobileUrl);
             if (metadata) {
+              console.log(`[INFO] [FETCH] Successfully extracted metadata from mobile URL ${mobileUrl}`);
               return metadata;
+            } else {
+              console.error(`[ERROR] [FETCH] No metadata extracted from mobile URL ${mobileUrl}`);
             }
+          } else {
+            console.error(`[ERROR] [FETCH] Mobile fallback also failed with HTTP ${mobileResponse.status} for ${mobileUrl}`);
           }
         } catch (mobileError) {
-          console.error(`[ERROR] Mobile fallback failed:`, mobileError instanceof Error ? mobileError.message : mobileError);
+          console.error(`[ERROR] [FETCH] Mobile fallback failed for ${mobileUrl}:`, mobileError instanceof Error ? mobileError.message : mobileError);
+          if (mobileError instanceof Error && mobileError.stack) {
+            console.error(`[ERROR] [FETCH] Mobile fallback stack:`, mobileError.stack);
+          }
         }
+      }
+
+      // Check if response indicates authentication required
+      const responseText = await response.text().catch(() => '');
+      if (responseText.includes('You must log in to continue') || responseText.includes('Log Into Facebook')) {
+        console.error(`[ERROR] [FETCH] Authentication required for ${normalizedUrl} - cannot extract metadata`);
       }
 
       return null;
@@ -222,6 +383,11 @@ export async function fetchFacebookMetadata(
     const html = await response.text();
     const metadata = extractMetadataFromHtml(html, normalizedUrl);
 
+    if (!metadata) {
+      console.error(`[ERROR] [METADATA] Failed to extract metadata from ${normalizedUrl}`);
+      return null;
+    }
+
     // Store in cache if available
     if (metadata && cache) {
       const cacheKey = getCacheKey(url);
@@ -229,15 +395,22 @@ export async function fetchFacebookMetadata(
         await cache.put(cacheKey, JSON.stringify(metadata), {
           expirationTtl: 3600, // 1 hour TTL
         });
+        console.log(`[INFO] [CACHE] Cached metadata for ${url}`);
       } catch (cacheError) {
-        console.error(`[ERROR] Cache write error:`, cacheError instanceof Error ? cacheError.message : cacheError);
+        console.error(`[ERROR] [CACHE] Cache write error for ${url}:`, cacheError instanceof Error ? cacheError.message : cacheError);
+        if (cacheError instanceof Error && cacheError.stack) {
+          console.error(`[ERROR] [CACHE] Cache write stack:`, cacheError.stack);
+        }
         // Continue even if cache write fails
       }
     }
 
     return metadata;
   } catch (error) {
-    console.error(`[FETCH] Error fetching metadata for ${url}:`, error instanceof Error ? error.message : error, error instanceof Error ? error.stack : '');
+    console.error(`[ERROR] [FETCH] Error fetching metadata for ${url}:`, error instanceof Error ? error.message : error);
+    if (error instanceof Error && error.stack) {
+      console.error(`[ERROR] [FETCH] Stack trace:`, error.stack);
+    }
     return null;
   }
 }
