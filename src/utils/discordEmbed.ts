@@ -1,19 +1,49 @@
-import type { FacebookMetadata } from './facebookMetadata';
+import type { LinkMetadata } from './facebookMetadata';
 
 /**
- * Creates a Discord embed from Facebook metadata
+ * Provider-specific configuration for embeds
  */
-export function createFacebookEmbed(metadata: FacebookMetadata, originalUrl: string): any {
+export interface ProviderConfig {
+  color?: number;
+}
+
+/**
+ * Creates a Discord embed from link metadata (generic, works for any provider)
+ */
+export function createRichPreviewEmbed(
+  metadata: LinkMetadata,
+  originalUrl: string,
+  providerConfig?: ProviderConfig
+): any {
   const embed: any = {
     type: 'rich',
-    color: 0x1877f2, // Facebook blue
-    url: metadata.url || originalUrl,
+    color: providerConfig?.color ?? 0x1877f2, // Default to Facebook blue if not specified
   };
 
-  if (metadata.title) {
-    embed.title = metadata.title;
+  // Extract domain from article URL for footer
+  let articleDomain: string | undefined;
+  if (metadata.articleUrl) {
+    try {
+      const url = new URL(metadata.articleUrl);
+      articleDomain = url.hostname.replace(/^www\./, ''); // Remove www. prefix
+    } catch {
+      // Invalid URL, skip
+    }
   }
 
+  // When there's an article URL, use article title as embed title and link to article
+  if (metadata.articleUrl && metadata.articleTitle) {
+    embed.title = metadata.articleTitle;
+    embed.url = metadata.articleUrl; // Title links to article URL
+  } else {
+    // Otherwise, use regular title and link to Facebook post
+    if (metadata.title) {
+      embed.title = metadata.title;
+    }
+    embed.url = metadata.url || originalUrl; // Title links to Facebook post
+  }
+
+  // Description is always from the FB post
   if (metadata.description) {
     embed.description = metadata.description;
     // Discord has a limit of 4096 characters for description
@@ -41,8 +71,18 @@ export function createFacebookEmbed(metadata: FacebookMetadata, originalUrl: str
     };
   }
 
-  // Add footer with site name if available
-  if (metadata.siteName) {
+  // Footer: show domain when there's an article URL, otherwise show site name
+  // Footer cannot be linked or bolded in Discord
+  if (metadata.articleUrl && articleDomain) {
+    // Discord footer has a limit of 2048 characters
+    let footerText = articleDomain;
+    if (footerText.length > 2048) {
+      footerText = footerText.substring(0, 2045) + '...';
+    }
+    embed.footer = {
+      text: footerText,
+    };
+  } else if (metadata.siteName) {
     embed.footer = {
       text: metadata.siteName,
     };

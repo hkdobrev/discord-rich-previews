@@ -2,7 +2,7 @@ import { DurableObject } from 'cloudflare:workers';
 import { DiscordClient, GatewayIntents, MessageHelper } from 'flarecord';
 import type { DurableObjectState, DurableObjectNamespace } from '@cloudflare/workers-types';
 import { extractFacebookUrls, fetchFacebookMetadata } from './utils/facebookMetadata';
-import { createFacebookEmbed } from './utils/discordEmbed';
+import { createRichPreviewEmbed } from './utils/discordEmbed';
 
 export interface Env {
   DISCORD_BOT_TOKEN: string;
@@ -25,8 +25,6 @@ export class DiscordBot extends DurableObject<Env> {
         console.error('[ERROR] DISCORD_BOT_TOKEN is missing from environment');
         throw new Error('DISCORD_BOT_TOKEN is required');
       }
-
-    try {
 
       this.client = new DiscordClient(ctx, {
       token: env.DISCORD_BOT_TOKEN,
@@ -56,6 +54,16 @@ export class DiscordBot extends DurableObject<Env> {
           return;
         }
 
+        // Ensure we have required message fields
+        if (!message.id) {
+          console.error(`[ERROR] [MESSAGE] Missing message ID in message data`);
+          return;
+        }
+
+        const messageId = message.id;
+        const channelId = message.channel_id;
+        const guildId = message.guild_id;
+
         // Extract Facebook URLs from the message
         const content = message.content || '';
         const facebookUrls = extractFacebookUrls(content);
@@ -64,38 +72,70 @@ export class DiscordBot extends DurableObject<Env> {
           return;
         }
 
+        console.log(`[INFO] [MESSAGE] Processing ${facebookUrls.length} Facebook URL(s) from message ${messageId} in channel ${channelId}`);
+
         // Check rate limit
-        const channelId = message.channel_id;
         if (!channelId || this.isRateLimited(channelId)) {
+          console.log(`[INFO] [RATE_LIMIT] Rate limit exceeded for channel ${channelId}`);
           return;
         }
 
         const messageHelper = this.messageHelper; // Store reference to avoid null check issues
 
         // Process all Facebook URLs in parallel
-        await Promise.allSettled(
+        const results = await Promise.allSettled(
           facebookUrls.map(async (url) => {
             try {
+              console.log(`[INFO] [PROCESS] Fetching metadata for ${url}`);
+
               // Fetch metadata with cache
               const metadata = await fetchFacebookMetadata(url, env.LINK_METADATA_CACHE);
 
-              if (metadata && (metadata.title || metadata.description)) {
-                // Create embed
-                const embed = createFacebookEmbed(metadata, url);
+              if (!metadata) {
+                console.error(`[ERROR] [PROCESS] No metadata extracted for ${url}`);
+                return;
+              }
 
-                // Send embed
-                await messageHelper.send(channelId, {
+              if (!metadata.title && !metadata.description) {
+                console.error(`[ERROR] [PROCESS] Metadata has no title or description for ${url}`);
+                return;
+              }
+
+              // Create embed with Facebook-specific color
+              const embed = createRichPreviewEmbed(metadata, url, { color: 0x1877f2 });
+
+              // Reply to the original message with embed
+              try {
+                await messageHelper.reply(channelId, messageId, guildId, {
                   embeds: [embed],
                 });
+                console.log(`[INFO] [PROCESS] Successfully replied with embed for ${url}`);
+              } catch (replyError) {
+                console.error(`[ERROR] [REPLY] Failed to reply for ${url}:`, replyError instanceof Error ? replyError.message : replyError);
+                if (replyError instanceof Error && replyError.stack) {
+                  console.error(`[ERROR] [REPLY] Stack trace:`, replyError.stack);
+                }
+                throw replyError; // Re-throw to be caught by outer catch
               }
             } catch (error) {
-              console.error(`[ERROR] Error processing Facebook URL ${url}:`, error instanceof Error ? error.message : error);
+              console.error(`[ERROR] [PROCESS] Error processing Facebook URL ${url} (message ${messageId}, channel ${channelId}):`, error instanceof Error ? error.message : error);
               if (error instanceof Error && error.stack) {
-                console.error(`[ERROR] Stack trace:`, error.stack);
+                console.error(`[ERROR] [PROCESS] Stack trace:`, error.stack);
               }
+              throw error; // Re-throw to ensure Promise.allSettled captures it
             }
           })
         );
+
+        // Log any rejected promises
+        results.forEach((result, index) => {
+          if (result.status === 'rejected') {
+            console.error(`[ERROR] [PROCESS] Promise rejected for URL ${facebookUrls[index]}:`, result.reason instanceof Error ? result.reason.message : result.reason);
+            if (result.reason instanceof Error && result.reason.stack) {
+              console.error(`[ERROR] [PROCESS] Rejected promise stack:`, result.reason.stack);
+            }
+          }
+        });
       },
       onDispatch: (event: string, data: any) => {
         // Dispatch events are handled by onReady/onMessage callbacks
@@ -109,13 +149,6 @@ export class DiscordBot extends DurableObject<Env> {
     });
     } catch (error) {
       console.error('[ERROR] Failed to initialize DiscordClient:', error instanceof Error ? error.message : error);
-      if (error instanceof Error && error.stack) {
-        console.error('[ERROR] Stack:', error.stack);
-      }
-      throw error;
-    }
-    } catch (error) {
-      console.error('[ERROR] Constructor error:', error instanceof Error ? error.message : error);
       if (error instanceof Error && error.stack) {
         console.error('[ERROR] Stack:', error.stack);
       }
