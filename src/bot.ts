@@ -112,8 +112,13 @@ export class DiscordBot extends DurableObject<Env> {
                 return;
               }
 
-              if (!metadata.title && !metadata.description) {
-                console.error(`[ERROR] [PROCESS] Metadata has no title or description for ${url}`);
+              // Check if we have enough metadata to create an embed
+              // For article posts, we need articleTitle; for regular posts, we need title, description, or image
+              const hasArticleContent = metadata.articleUrl && metadata.articleTitle;
+              const hasRegularContent = metadata.title || metadata.description || metadata.image;
+
+              if (!hasArticleContent && !hasRegularContent) {
+                console.error(`[ERROR] [PROCESS] Metadata has no title, description, image, or article title for ${url}`);
                 return;
               }
 

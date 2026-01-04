@@ -20,19 +20,40 @@ function extractMetadataFromHtml(html: string, url: string): LinkMetadata | null
   const metadata: LinkMetadata = {};
 
   // Extract og:title
-  const titleMatch = html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i);
+  // Use a more flexible pattern that handles HTML entities and different quote styles
+  // Pattern allows for single or double quotes and handles HTML entities
+  const titlePatterns = [
+    /<meta\s+property=["']og:title["']\s+content=["']([^"']*(?:&#[0-9]+;|&#x[0-9a-fA-F]+;)*[^"']*)["']/i,
+    /<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i,
+  ];
+
+  let titleMatch: RegExpMatchArray | null = null;
+  for (const pattern of titlePatterns) {
+    titleMatch = html.match(pattern);
+    if (titleMatch) break;
+  }
+
   if (titleMatch) {
     metadata.title = cleanEscapeSequences(decodeHtmlEntities(titleMatch[1]));
+    console.log(`[DEBUG] [EXTRACT] Extracted title: ${metadata.title.substring(0, 50)}...`);
+  } else {
+    const ogTitleIndex = html.indexOf('og:title');
+    const htmlSample = ogTitleIndex > 0
+      ? html.substring(Math.max(0, ogTitleIndex - 50), Math.min(html.length, ogTitleIndex + 200))
+      : 'og:title not found in HTML';
+    console.log(`[DEBUG] [EXTRACT] No og:title match found. HTML sample: ${htmlSample}`);
   }
 
   // Extract og:description
-  const descMatch = html.match(/<meta\s+property=["']og:description["']\s+content=["']([^"']+)["']/i);
+  const descMatch = html.match(/<meta\s+property=["']og:description["']\s+content=["']((?:[^"']|&#[0-9]+;|&#x[0-9a-fA-F]+;)+)["']/i) ||
+                              html.match(/<meta\s+property=["']og:description["']\s+content=["']([^"']+)["']/i);
   if (descMatch) {
     metadata.description = cleanEscapeSequences(decodeHtmlEntities(descMatch[1]));
   }
 
   // Extract og:image (decode HTML entities so image hash works correctly)
-  const imageMatch = html.match(/<meta\s+property=["']og:image["']\s+content=["']([^"']+)["']/i);
+  const imageMatch = html.match(/<meta\s+property=["']og:image["']\s+content=["']((?:[^"']|&#[0-9]+;|&#x[0-9a-fA-F]+;)+)["']/i) ||
+                              html.match(/<meta\s+property=["']og:image["']\s+content=["']([^"']+)["']/i);
   if (imageMatch) {
     let imageUrl = decodeHtmlEntities(imageMatch[1]);
 
@@ -218,8 +239,9 @@ function extractMetadataFromHtml(html: string, url: string): LinkMetadata | null
     }
   }
 
-  // If we have at least a title or description, return the metadata
-  if (metadata.title || metadata.description) {
+  // If we have at least a title, description, or image, return the metadata
+  // This handles cases like group pages that may have og:title and og:image but no description
+  if (metadata.title || metadata.description || metadata.image) {
     metadata.url = metadata.url || url;
     return metadata;
   }
@@ -283,6 +305,26 @@ export async function fetchFacebookMetadata(
 
     // Normalize Facebook share URLs - they often redirect to the actual post
     let normalizedUrl = url;
+
+    // Handle Facebook group URLs with multi_permalinks - extract the actual post permalink
+    // Example: /groups/123/?multi_permalinks=456 -> /groups/123/permalink/456/
+    if (url.includes('/groups/') && url.includes('multi_permalinks=')) {
+      try {
+        const urlObj = new URL(url);
+        const multiPermalinks = urlObj.searchParams.get('multi_permalinks');
+        if (multiPermalinks) {
+          // Construct the direct permalink URL
+          const groupId = urlObj.pathname.match(/\/groups\/(\d+)/)?.[1];
+          if (groupId) {
+            normalizedUrl = `https://www.facebook.com/groups/${groupId}/permalink/${multiPermalinks}/`;
+            console.error(`[ERROR] [URL_NORMALIZE] Converted multi_permalinks URL to permalink: ${normalizedUrl}`);
+          }
+        }
+      } catch (urlError) {
+        console.error(`[ERROR] [URL_NORMALIZE] Failed to normalize multi_permalinks URL ${url}:`, urlError instanceof Error ? urlError.message : urlError);
+        // Continue with original URL if normalization fails
+      }
+    }
 
     // Handle Facebook share URLs (facebook.com/share/... or m.facebook.com/share/...)
     // These URLs redirect to the actual post, so we'll follow redirects
@@ -384,12 +426,42 @@ export async function fetchFacebookMetadata(
     }
 
     const html = await response.text();
+
+    // Check if HTML contains og:title and if it's a login page
+    const hasOgTitle = html.includes('og:title');
+    const hasOgImage = html.includes('og:image');
+    const hasOgDescription = html.includes('og:description');
+    const isLoginPage = html.includes('You must log in to continue') || html.includes('Log Into Facebook') || html.includes('Log in to Facebook');
+
+    console.error(`[ERROR] [METADATA] Response status: ${response.status}, HTML length: ${html.length}, hasOgTitle: ${hasOgTitle}, hasOgImage: ${hasOgImage}, isLoginPage: ${isLoginPage} for ${normalizedUrl}`);
+
+    if (isLoginPage) {
+      console.error(`[ERROR] [METADATA] Facebook returned login page for ${normalizedUrl} - authentication required`);
+      return null;
+    }
+
+    // If HTML doesn't contain og tags at all, log more details
+    if (!hasOgTitle && !hasOgImage && !hasOgDescription) {
+      const htmlStart = html.substring(0, 1000);
+      console.error(`[ERROR] [METADATA] No og tags found in HTML. First 1000 chars: ${htmlStart}`);
+    }
+
     const metadata = extractMetadataFromHtml(html, normalizedUrl);
 
     if (!metadata) {
       console.error(`[ERROR] [METADATA] Failed to extract metadata from ${normalizedUrl}`);
+      // Log a sample of the HTML around og:title if it exists
+      const ogTitleIndex = html.indexOf('og:title');
+      if (ogTitleIndex > 0) {
+        const htmlSample = html.substring(Math.max(0, ogTitleIndex - 100), Math.min(html.length, ogTitleIndex + 300));
+        console.error(`[ERROR] [METADATA] HTML around og:title: ${htmlSample}`);
+      } else {
+        console.error(`[ERROR] [METADATA] og:title not found in HTML. First 500 chars: ${html.substring(0, 500)}`);
+      }
       return null;
     }
+
+    console.error(`[ERROR] [METADATA] Successfully extracted - title: ${metadata.title ? 'yes' : 'no'}, description: ${metadata.description ? 'yes' : 'no'}, image: ${metadata.image ? 'yes' : 'no'}`);
 
     // Store in cache if available
     if (metadata && cache) {
