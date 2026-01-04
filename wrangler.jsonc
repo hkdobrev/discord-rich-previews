@@ -1,0 +1,43 @@
+{
+	"name": "discord-rich-previews",
+	"main": "src/index.ts",
+	"compatibility_date": "2024-11-01",
+	"kv_namespaces": [
+		{
+			"binding": "LINK_METADATA_CACHE",
+			// Replace with your KV namespace ID from: wrangler kv namespace create LINK_METADATA_CACHE
+			"id": "52ca52a99b074d72832e283110822e1d",
+			"remote": true
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "DISCORD_BOT",
+				"class_name": "DiscordBot",
+				"script_name": "discord-rich-previews"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_classes": [
+				"DiscordBot"
+			]
+		}
+	],
+	"observability": {
+		"logs": {
+			"enabled": true,
+			"head_sampling_rate": 0.1,
+			"invocation_logs": false,
+			"persist": true
+		},
+		"traces": {
+			"enabled": true,
+			"head_sampling_rate": 0.1,
+			"persist": true
+		}
+	}
+}
