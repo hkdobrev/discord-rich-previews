@@ -288,7 +288,10 @@ export async function fetchFacebookMetadata(
     // These URLs redirect to the actual post, so we'll follow redirects
     if (url.includes('/share/')) {
       // Ensure we're using the www version for better metadata extraction
-      normalizedUrl = url.replace(/^(https?:\/\/)(m\.|www\.)?(facebook\.com)/, '$1www.$3');
+      // Only replace if www. is not already present
+      if (!url.includes('www.facebook.com')) {
+        normalizedUrl = url.replace(/^(https?:\/\/)(m\.)?(facebook\.com)/, '$1www.$3');
+      }
     }
 
     // Handle Facebook story.php URLs - normalize to www version and ensure proper format
