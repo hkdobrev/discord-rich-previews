@@ -14,10 +14,12 @@ export class DiscordBot extends DurableObject<Env> {
   private client: DiscordClient;
   private messageHelper: MessageHelper | null = null;
   private botToken: string;
+  private ctx: DurableObjectState;
   private rateLimitTimestamps: Map<string, number[]> = new Map();
   private readonly RATE_LIMIT_MAX_REQUESTS = 10;
   private readonly RATE_LIMIT_WINDOW_MS = 60000; // 1 minute
   private readonly SUPPRESS_EMBEDS_FLAG = 1 << 2; // 4
+  private readonly ALARM_INTERVAL_MS = 30000; // 30 seconds - keep DO alive and connection active
 
   constructor(ctx: DurableObjectState, env: Env) {
     try {
@@ -28,6 +30,7 @@ export class DiscordBot extends DurableObject<Env> {
         throw new Error('DISCORD_BOT_TOKEN is required');
       }
 
+      this.ctx = ctx;
       this.botToken = env.DISCORD_BOT_TOKEN;
 
       this.client = new DiscordClient(ctx, {
@@ -36,9 +39,11 @@ export class DiscordBot extends DurableObject<Env> {
         GatewayIntents.GUILDS |
         GatewayIntents.GUILD_MESSAGES |
         GatewayIntents.MESSAGE_CONTENT,
-      onReady: (data: any) => {
+      onReady: async (data: any) => {
         console.log(`[READY] Bot ready: ${data.user?.username || 'unknown'} (ID: ${data.user?.id || 'unknown'})`);
         this.messageHelper = new MessageHelper(env.DISCORD_BOT_TOKEN);
+        // Schedule first alarm to keep DO alive
+        await this.scheduleAlarm();
       },
       onMessage: async (data: any) => {
         if (data._gatewayMetadata?.event !== 'MESSAGE_CREATE') {
@@ -253,6 +258,12 @@ export class DiscordBot extends DurableObject<Env> {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
+    // Schedule alarm on any fetch to ensure DO stays alive
+    // This helps recover from evictions
+    await this.scheduleAlarm().catch(err => {
+      console.error(`[ERROR] Failed to schedule alarm:`, err instanceof Error ? err.message : err);
+    });
+
     if (!this.client) {
       console.error(`[ERROR] DiscordClient not initialized`);
       return new Response(JSON.stringify({ error: 'DiscordClient not initialized' }), {
@@ -268,6 +279,7 @@ export class DiscordBot extends DurableObject<Env> {
       try {
         const initRequest = new Request('https://discord.com/api', { method: 'GET' });
         await this.client.fetch(initRequest);
+        console.log(`[INFO] Gateway connection initialized/reinitialized`);
       } catch (err) {
         console.error(`[ERROR] Error initializing Gateway connection:`, err instanceof Error ? err.message : err);
       }
@@ -308,13 +320,57 @@ export class DiscordBot extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
+    console.log(`[INFO] [ALARM] Alarm triggered - ensuring Gateway connection is alive`);
     try {
-      await this.client.alarm();
-    } catch (error) {
-      console.error(`[ERROR] Error in alarm:`, error instanceof Error ? error.message : error);
-      if (error instanceof Error && error.stack) {
-        console.error(`[ERROR] Stack:`, error.stack);
+      // Ensure client is initialized
+      if (!this.client) {
+        console.error(`[ERROR] [ALARM] DiscordClient not initialized, cannot recover`);
+        // Reschedule alarm to retry later
+        await this.scheduleAlarm();
+        return;
       }
+
+      // Call flarecord's alarm to keep Gateway connection alive
+      // This will reconnect if the connection was lost
+      await this.client.alarm();
+      console.log(`[INFO] [ALARM] Gateway connection kept alive successfully`);
+
+      // Reinitialize connection if needed by calling fetch
+      // This ensures the Gateway is connected
+      try {
+        const initRequest = new Request('https://discord.com/api', { method: 'GET' });
+        await this.client.fetch(initRequest);
+        console.log(`[INFO] [ALARM] Gateway connection verified`);
+      } catch (err) {
+        console.error(`[ERROR] [ALARM] Error verifying Gateway connection:`, err instanceof Error ? err.message : err);
+      }
+
+      // Reschedule next alarm to maintain the cycle
+      await this.scheduleAlarm();
+    } catch (error) {
+      console.error(`[ERROR] [ALARM] Error in alarm handler:`, error instanceof Error ? error.message : error);
+      if (error instanceof Error && error.stack) {
+        console.error(`[ERROR] [ALARM] Stack:`, error.stack);
+      }
+      // Still reschedule alarm even on error to keep trying
+      try {
+        await this.scheduleAlarm();
+      } catch (scheduleError) {
+        console.error(`[ERROR] [ALARM] Failed to reschedule alarm:`, scheduleError instanceof Error ? scheduleError.message : scheduleError);
+      }
+    }
+  }
+
+  /**
+   * Schedule the next alarm to keep the Durable Object alive
+   */
+  private async scheduleAlarm(): Promise<void> {
+    try {
+      const nextAlarmTime = Date.now() + this.ALARM_INTERVAL_MS;
+      await this.ctx.storage.setAlarm(nextAlarmTime);
+      console.log(`[INFO] [ALARM] Scheduled next alarm at ${new Date(nextAlarmTime).toISOString()}`);
+    } catch (error) {
+      console.error(`[ERROR] [ALARM] Failed to schedule alarm:`, error instanceof Error ? error.message : error);
       throw error;
     }
   }
